@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Sorrel OTA Checker
+XR OTA Checker
 Reads numbered files (1.txt, 2.txt, 3.txt, ...) until no file is found.
 Each file: first line = build fingerprint, remaining lines = serial numbers.
 Performs checkin requests and reports new OTA URLs to logs and Discord.
@@ -353,7 +353,7 @@ def send_discord(findings):
     if len(body) > 1900:
         body = body[:1900] + "\n...(truncated)"
 
-    content = f"**New Sorrel OTA ({count} update{'s' if count > 1 else ''}) — {ts}**\n```\n{body}\n```"
+    content = f"**New Android XR OTA ({count} update{'s' if count > 1 else ''}) — {ts}**\n```\n{body}\n```"
     payload = {"content": content}
 
     if DISCORD_WEBHOOK:
@@ -603,7 +603,7 @@ def load_numbered_files():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Main sorrel run
+#  Main XR run
 # ─────────────────────────────────────────────────────────────────────────────
 
 def checkin_with_fingerprint_chain(serial, initial_fingerprint, archived_urls, new_findings, indent="  "):
@@ -760,7 +760,7 @@ def main():
     parser.add_argument(
         "--sorrel",
         action="store_true",
-        help="Run sorrel OTA checker using fingerprint+serials from 1.txt, 2.txt, ...",
+        help="Run XR OTA checker using fingerprint+serials from 1.txt, 2.txt, ...",
     )
     args, _ = parser.parse_known_args()
 
