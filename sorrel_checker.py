@@ -606,6 +606,93 @@ def load_numbered_files():
 #  Main sorrel run
 # ─────────────────────────────────────────────────────────────────────────────
 
+def checkin_with_fingerprint_chain(serial, initial_fingerprint, archived_urls, new_findings, indent="  "):
+    """
+    Given a serial and a starting fingerprint, performs checkin.
+    If a new OTA is found:
+      - fetches its metadata
+      - extracts all fingerprints from post-build (split by |)
+      - iterates each fingerprint with the same serial recursively
+    Returns list of newly discovered OTA dicts (already appended to new_findings).
+    """
+    queue = [initial_fingerprint]
+    visited_fingerprints = set()
+
+    while queue:
+        fingerprint = queue.pop(0)
+        if fingerprint in visited_fingerprints:
+            continue
+        visited_fingerprints.add(fingerprint)
+
+        log(f"{indent}Trying fingerprint: {fingerprint}")
+
+        try:
+            settings = perform_checkin(fingerprint, device_sn=serial)
+            ota      = find_ota_link(settings)
+
+            if not (ota and ota["url"]):
+                log(f"{indent}No OTA update found.")
+                continue
+
+            url = ota["url"]
+            if url in archived_urls:
+                log(f"{indent}URL already archived, skipping.")
+                continue
+
+            log(f"{indent}*** NEW URL FOUND ***")
+            finding_text = format_finding(ota)
+            for line in finding_text.splitlines():
+                log(f"{indent}{line}")
+
+            # Fetch metadata from the OTA ZIP
+            extra_fingerprints = []
+            try:
+                log(f"{indent}Fetching OTA metadata...")
+                meta = fetch_ota_metadata(url)
+                if meta['found'] and meta['fields']:
+                    fields = meta['fields']
+
+                    post_build_raw = fields.get('post-build', '')
+                    if post_build_raw:
+                        # Split by | to get all fingerprints
+                        all_fps = [fp.strip() for fp in post_build_raw.split('|') if fp.strip()]
+                        # Store only the first one in the OTA record (clean)
+                        clean_fp = all_fps[0] if all_fps else post_build_raw
+                        log(f"{indent}Fingerprint: {clean_fp}")
+                        ota['post_build'] = clean_fp
+                        # Queue the rest for further checking with same serial
+                        extra_fingerprints = all_fps
+
+                    pre_build = fields.get('pre-build', '')
+                    if pre_build:
+                        # Also trim pre-build after | if present
+                        clean_pre = pre_build.split('|')[0].strip()
+                        log(f"{indent}Pre-build:   {clean_pre}")
+                        ota['pre_build'] = clean_pre
+                else:
+                    log(f"{indent}Metadata: not found{(' — ' + meta['error']) if meta.get('error') else ''}")
+            except Exception as me:
+                log(f"{indent}Metadata fetch error: {me}")
+
+            log("")  # blank line separator
+
+            new_findings.append(ota)
+            archived_urls.add(url)
+            save_archived_url(url)
+
+            # Queue all fingerprints from post-build for the same serial
+            if extra_fingerprints:
+                log(f"{indent}Queueing {len(extra_fingerprints)} fingerprint(s) from post-build for serial {serial}...")
+                for fp in extra_fingerprints:
+                    if fp not in visited_fingerprints:
+                        queue.append(fp)
+
+        except Exception as e:
+            log(f"{indent}[ERROR] {e}")
+
+        time.sleep(REQUEST_DELAY_SEC)
+
+
 def run_sorrel():
     log("=" * 60)
     log("Sorrel OTA checker started.")
@@ -628,53 +715,7 @@ def run_sorrel():
 
         for idx, serial in enumerate(serials, 1):
             log(f"[{idx}/{total}] Checking serial: {serial}")
-
-            try:
-                settings = perform_checkin(fingerprint, device_sn=serial)
-                ota      = find_ota_link(settings)
-
-                if ota and ota["url"]:
-                    url = ota["url"]
-                    if url not in archived_urls:
-                        log(f"  *** NEW URL FOUND ***")
-                        finding_text = format_finding(ota)
-                        for line in finding_text.splitlines():
-                            log(f"  {line}")
-
-                        # Fetch metadata from the OTA ZIP
-                        try:
-                            log(f"  Fetching OTA metadata...")
-                            meta = fetch_ota_metadata(url)
-                            if meta['found'] and meta['fields']:
-                                fields = meta['fields']
-                                post_build = fields.get('post-build', '')
-                                if post_build:
-                                    log(f"  Fingerprint: {post_build}")
-                                    ota['post_build'] = post_build
-                                pre_build = fields.get('pre-build', '')
-                                if pre_build:
-                                    log(f"  Pre-build:   {pre_build}")
-                                    ota['pre_build'] = pre_build
-                            else:
-                                log(f"  Metadata: not found{(' — ' + meta['error']) if meta.get('error') else ''}")
-                        except Exception as me:
-                            log(f"  Metadata fetch error: {me}")
-
-                        log("")  # blank line separator
-
-                        new_findings.append(ota)
-                        archived_urls.add(url)
-                        save_archived_url(url)
-                    else:
-                        log(f"  URL already archived, skipping.")
-                else:
-                    log(f"  No OTA update found.")
-
-            except Exception as e:
-                log(f"  [ERROR] {e}")
-
-            if idx < total:
-                time.sleep(REQUEST_DELAY_SEC)
+            checkin_with_fingerprint_chain(serial, fingerprint, archived_urls, new_findings)
 
     log(f"\nRun complete. {len(new_findings)} new finding(s) this run.")
     log("=" * 60)
