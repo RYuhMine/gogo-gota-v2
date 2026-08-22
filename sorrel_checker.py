@@ -31,7 +31,6 @@ from datetime import datetime, timezone
 # ─────────────────────────────────────────────────────────────────────────────
 
 ARCHIVED_FILE      = "archived.txt"
-ARCHIVED_FP_FILE   = "archived_fingerprints.txt"   # post-build fingerprints seen so far
 LOG_FILE           = "sorrel_checker.log"
 CHECKIN_URL        = "http://android.googleapis.com/checkin"
 
@@ -307,18 +306,6 @@ def load_archived_urls(path=ARCHIVED_FILE):
 def save_archived_url(url, path=ARCHIVED_FILE):
     with open(path, "a", encoding="utf-8") as f:
         f.write(url + "\n")
-
-
-def load_archived_fingerprints(path=ARCHIVED_FP_FILE):
-    if not os.path.exists(path):
-        return set()
-    with open(path, "r", encoding="utf-8") as f:
-        return {line.strip() for line in f if line.strip()}
-
-
-def save_archived_fingerprint(fp, path=ARCHIVED_FP_FILE):
-    with open(path, "a", encoding="utf-8") as f:
-        f.write(fp + "\n")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -642,18 +629,56 @@ def load_numbered_files():
 #  Core checkin with fingerprint chain
 # ─────────────────────────────────────────────────────────────────────────────
 
-def checkin_with_fingerprint_chain(serial, initial_fingerprint, archived_urls,
-                                   archived_fps, new_findings, indent="  "):
+def get_post_build_fingerprints(url, reference_fingerprint, indent="  "):
     """
-    Given a serial and a starting fingerprint, performs checkin.
-    If a new OTA is found:
-      - fetches its metadata
-      - extracts all fingerprints from post-build (split by |), saves them to archived_fps
-      - iterates each fingerprint with the same serial
-    Only URLs not in archived_urls are reported as new findings.
+    Fetches OTA metadata from a ZIP URL and returns (all_fps, clean_fp, pre_build_clean).
+    all_fps   — full list split by | from post-build (for chaining)
+    clean_fp  — the one matching reference_fingerprint's device (for display)
+    clean_pre — matching pre-build entry (for display)
+    """
+    try:
+        log(f"{indent}Fetching OTA metadata...")
+        meta = fetch_ota_metadata(url)
+        if not (meta['found'] and meta['fields']):
+            log(f"{indent}Metadata: not found{(' — ' + meta['error']) if meta.get('error') else ''}")
+            return [], None, None
+
+        fields = meta['fields']
+        all_fps   = []
+        clean_fp  = None
+        clean_pre = None
+
+        post_build_raw = fields.get('post-build', '')
+        if post_build_raw:
+            all_fps  = [fp.strip() for fp in post_build_raw.split('|') if fp.strip()]
+            clean_fp = pick_matching_fingerprint(all_fps, reference_fingerprint)
+
+        pre_build = fields.get('pre-build', '')
+        if pre_build:
+            pre_fps   = [fp.strip() for fp in pre_build.split('|') if fp.strip()]
+            clean_pre = pick_matching_fingerprint(pre_fps, reference_fingerprint)
+
+        return all_fps, clean_fp, clean_pre
+
+    except Exception as me:
+        log(f"{indent}Metadata fetch error: {me}")
+        return [], None, None
+
+
+def checkin_with_fingerprint_chain(serial, initial_fingerprint, archived_urls,
+                                   new_findings, indent="  "):
+    """
+    Logic per serial+fingerprint:
+      1. Checkin → get URL
+      2. If URL is NEW → log, save to archived, send to Discord, fetch post-build → chain those fingerprints
+      3. If URL already EXISTS → silently fetch post-build → chain those fingerprints (no report)
+      4. Each chained fingerprint is tried once; if it returns the same URL that was already
+         processed in this chain — skip (don't fetch metadata again for it).
     """
     queue = [initial_fingerprint]
     visited_fingerprints = set()
+    # URLs whose post-build fingerprints have already been queued this chain
+    expanded_urls = set()
 
     while queue:
         fingerprint = queue.pop(0)
@@ -672,60 +697,45 @@ def checkin_with_fingerprint_chain(serial, initial_fingerprint, archived_urls,
                 time.sleep(REQUEST_DELAY_SEC)
                 continue
 
-            url = ota["url"]
+            url    = ota["url"]
             is_new = url not in archived_urls
 
-            if is_new:
-                log(f"{indent}*** NEW URL FOUND ***")
-            else:
-                log(f"{indent}URL already archived, skipping.")
+            if url not in expanded_urls:
+                expanded_urls.add(url)
+                all_fps, clean_fp, clean_pre = get_post_build_fingerprints(
+                    url, fingerprint, indent=indent
+                )
 
-            # Always fetch metadata to collect post-build fingerprints for chaining,
-            # but only log/report if this URL is new
-            extra_fingerprints = []
-            try:
                 if is_new:
-                    log(f"{indent}Fetching OTA metadata...")
-                meta = fetch_ota_metadata(url)
-                if meta['found'] and meta['fields']:
-                    fields = meta['fields']
-
-                    post_build_raw = fields.get('post-build', '')
-                    if post_build_raw:
-                        all_fps = [fp.strip() for fp in post_build_raw.split('|') if fp.strip()]
-                        clean_fp = pick_matching_fingerprint(all_fps, fingerprint)
-                        if is_new:
-                            log(f"{indent}Fingerprint: {clean_fp}")
-                            ota['post_build'] = clean_fp
-                        extra_fingerprints = all_fps
-
-                    pre_build = fields.get('pre-build', '')
-                    if pre_build and is_new:
-                        pre_fps = [fp.strip() for fp in pre_build.split('|') if fp.strip()]
-                        clean_pre = pick_matching_fingerprint(pre_fps, fingerprint)
+                    log(f"{indent}*** NEW URL FOUND ***")
+                    log(f"{indent}URL: {url}")
+                    if ota.get("title"):       log(f"{indent}Title: {ota['title']}")
+                    if ota.get("description"): log(f"{indent}Description: {ota['description']}")
+                    if ota.get("size"):        log(f"{indent}Size: {ota['size']}")
+                    if clean_fp:
+                        log(f"{indent}Fingerprint: {clean_fp}")
+                        ota['post_build'] = clean_fp
+                    if clean_pre:
                         log(f"{indent}Pre-build:   {clean_pre}")
                         ota['pre_build'] = clean_pre
+                    log("")
+                    new_findings.append(ota)
+                    archived_urls.add(url)
+                    save_archived_url(url)
                 else:
-                    if is_new:
-                        log(f"{indent}Metadata: not found{(' — ' + meta['error']) if meta.get('error') else ''}")
-            except Exception as me:
+                    log(f"{indent}URL already archived — checking post-build fingerprints.")
+
+                # Either way, chain the post-build fingerprints
+                for fp in all_fps:
+                    if fp not in visited_fingerprints:
+                        queue.append(fp)
+            else:
+                # URL already expanded this run — just skip
                 if is_new:
-                    log(f"{indent}Metadata fetch error: {me}")
-
-            if is_new:
-                log("")  # blank line separator
-                new_findings.append(ota)
-                archived_urls.add(url)
-                save_archived_url(url)
-
-            # Queue all post-build fingerprints we haven't tried yet
-            for fp in extra_fingerprints:
-                if fp not in visited_fingerprints:
-                    queue.append(fp)
-                # Save newly seen fingerprints for future runs
-                if fp not in archived_fps:
-                    archived_fps.add(fp)
-                    save_archived_fingerprint(fp)
+                    # Shouldn't normally happen, but handle it
+                    log(f"{indent}*** NEW URL FOUND (already expanded) ***")
+                else:
+                    log(f"{indent}URL already archived and expanded, skipping.")
 
         except Exception as e:
             log(f"{indent}[ERROR] {e}")
@@ -741,7 +751,6 @@ def run_xr():
     log("=" * 60)
     log("Android XR OTA checker started.")
 
-    # Load fingerprint+serials from numbered files
     file_groups = load_numbered_files()
 
     if not file_groups:
@@ -751,34 +760,17 @@ def run_xr():
     archived_urls = load_archived_urls()
     log(f"Loaded {len(archived_urls)} archived URL(s) from {ARCHIVED_FILE}.")
 
-    archived_fps = load_archived_fingerprints()
-    log(f"Loaded {len(archived_fps)} archived fingerprint(s) from {ARCHIVED_FP_FILE}.")
-
     new_findings = []
 
-    # Collect all serials across all files for re-checking archived fingerprints
-    all_serials = []
     for fingerprint, serials, filename in file_groups:
         log(f"\n--- Processing {filename} | Fingerprint: {fingerprint} ---")
         total = len(serials)
-        all_serials.extend(serials)
 
         for idx, serial in enumerate(serials, 1):
             log(f"[{idx}/{total}] Checking serial: {serial}")
             checkin_with_fingerprint_chain(
-                serial, fingerprint, archived_urls, archived_fps, new_findings
+                serial, fingerprint, archived_urls, new_findings
             )
-
-    # Re-check all previously seen post-build fingerprints with all serials
-    if archived_fps:
-        log(f"\n--- Re-checking {len(archived_fps)} archived fingerprint(s) with all serials ---")
-        unique_serials = list(dict.fromkeys(all_serials))  # preserve order, deduplicate
-        for fp in sorted(archived_fps):
-            for serial in unique_serials:
-                log(f"  Re-check | serial={serial} | fp={fp}")
-                checkin_with_fingerprint_chain(
-                    serial, fp, archived_urls, archived_fps, new_findings
-                )
 
     log(f"\nRun complete. {len(new_findings)} new finding(s) this run.")
     log("=" * 60)
