@@ -1,0 +1,46 @@
+name: Android XR OTA Checker
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'   # every 5 minutes
+  workflow_dispatch:          # allow manual runs from the Actions tab
+
+jobs:
+  check-androidxr:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Run Android XR OTA checker
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+          DISCORD_WEBHOOK_2: ${{ secrets.DISCORD_WEBHOOK_2 }}
+        run: |
+          python sorrel_checker.py --sorrel
+
+      - name: Commit and push archived URLs
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add archived.txt
+          if git diff --quiet && git diff --staged --quiet; then
+            echo "No changes to archived.txt"
+          else
+            git commit -m "Update archived URLs"
+            git push
+          fi
+
+      - name: Upload log as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: androidxr-log-${{ github.run_id }}
+          path: sorrel_checker.log
+          retention-days: 30
