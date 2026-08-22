@@ -656,17 +656,44 @@ def checkin_with_fingerprint_chain(serial, initial_fingerprint, archived_urls, n
                     if post_build_raw:
                         # Split by | to get all fingerprints
                         all_fps = [fp.strip() for fp in post_build_raw.split('|') if fp.strip()]
-                        # Store only the first one in the OTA record (clean)
-                        clean_fp = all_fps[0] if all_fps else post_build_raw
+                        # Try to find the fingerprint whose device matches the one we queried with
+                        try:
+                            current_device = parse_fingerprint(fingerprint)["device"]
+                        except Exception:
+                            current_device = None
+                        matching_fp = None
+                        if current_device:
+                            for fp in all_fps:
+                                try:
+                                    if parse_fingerprint(fp)["device"] == current_device:
+                                        matching_fp = fp
+                                        break
+                                except Exception:
+                                    continue
+                        clean_fp = matching_fp if matching_fp else (all_fps[0] if all_fps else post_build_raw)
                         log(f"{indent}Fingerprint: {clean_fp}")
                         ota['post_build'] = clean_fp
-                        # Queue the rest for further checking with same serial
+                        # Queue all fingerprints for further checking with same serial
                         extra_fingerprints = all_fps
 
                     pre_build = fields.get('pre-build', '')
                     if pre_build:
-                        # Also trim pre-build after | if present
-                        clean_pre = pre_build.split('|')[0].strip()
+                        # Pick matching device in pre-build too, or trim after |
+                        pre_fps = [fp.strip() for fp in pre_build.split('|') if fp.strip()]
+                        try:
+                            current_device = parse_fingerprint(fingerprint)["device"]
+                        except Exception:
+                            current_device = None
+                        matching_pre = None
+                        if current_device:
+                            for fp in pre_fps:
+                                try:
+                                    if parse_fingerprint(fp)["device"] == current_device:
+                                        matching_pre = fp
+                                        break
+                                except Exception:
+                                    continue
+                        clean_pre = matching_pre if matching_pre else (pre_fps[0] if pre_fps else pre_build)
                         log(f"{indent}Pre-build:   {clean_pre}")
                         ota['pre_build'] = clean_pre
                 else:
