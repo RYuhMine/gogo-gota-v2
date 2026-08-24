@@ -634,12 +634,10 @@ def get_post_build_fingerprints(url, reference_fingerprint, indent="  "):
                 if plain:
                     fields = _parse_all_metadata_lines(plain, PAYLOAD_METADATA_PREFIXES)
                     if fields:
-                        out['found'] = True
-                        out['fields'] = fields
-                        return out
+                        return {'found': True, 'fields': fields, 'error': None}
     except Exception as e:
-        out['error'] = f"EOCD fast path failed: {e}"
-
+        # НЕ повертаємо помилку як фатальну — просто логуємо і падаємо далі
+        print(f"    [WARN] EOCD fast path failed: {e}")
 
 def checkin_with_fingerprint_chain(serial, initial_fingerprint, archived_urls,
                                    new_findings, expanded_urls, visited_fingerprints,
