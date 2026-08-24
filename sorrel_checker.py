@@ -495,131 +495,57 @@ def _find_zip_metadata_entry(tail_blob: bytes, tail_offset: int):
     return None
 
 
-def fetch_ota_metadata(url: str, timeout: int = 20) -> dict:
-    """
-    Fetches OTA metadata without downloading the whole file.
+ZIP64_EOCD_SIG     = b'PK\x06\x06'
+ZIP64_LOCATOR_SIG  = b'PK\x06\x07'
 
-    Strategy:
-    1. EOCD fast path: fetch only 66 KB tail to find EOCD, then fetch only the
-       central directory (usually a few KB), then fetch only the metadata entry.
-       Works for any file size including 6+ GB OTAs.
-    2. Fallback: 2 MB tail raw scan for known key prefixes.
-    """
-    out = {'found': False, 'fields': {}, 'error': None}
-
-    def _get_range(range_header):
-        req_h = {'User-Agent': _METADATA_UA, 'Accept-Encoding': 'identity', 'Range': range_header}
-        req = urllib.request.Request(url, headers=req_h)
-        ctx = ssl.create_default_context()
-        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
-            return resp.read()
-
-    # Get file size
+def _parse_zip64_eocd(tail_blob: bytes):
+    """Returns (total_size, cd_size, cd_offset) or None."""
+    pos = tail_blob.rfind(ZIP64_EOCD_SIG)
+    if pos == -1:
+        return None
     try:
-        head_req = urllib.request.Request(url, method='HEAD',
-                                          headers={'User-Agent': _METADATA_UA,
-                                                   'Accept-Encoding': 'identity'})
-        ctx = ssl.create_default_context()
-        with urllib.request.urlopen(head_req, timeout=timeout, context=ctx) as resp:
-            total_size = int(resp.headers.get('Content-Length', '0') or '0')
-    except Exception as e:
-        out['error'] = f"HEAD failed: {e}"
-        return out
+        total_size = struct.unpack('<Q', tail_blob[pos + 40:pos + 48])[0]
+        cd_size    = struct.unpack('<Q', tail_blob[pos + 48:pos + 56])[0]
+        cd_offset  = struct.unpack('<Q', tail_blob[pos + 56:pos + 64])[0]
+        return total_size, cd_size, cd_offset
+    except struct.error:
+        return None
 
-    if total_size <= 0:
-        out['error'] = "Cannot determine file size"
-        return out
 
-    # ── Fast path: EOCD → precise central directory → metadata entry ──────
-    try:
-        # 66 KB is enough to contain EOCD (22 bytes + up to 65535 bytes comment)
-        eocd_window = min(total_size, 66 * 1024)
-        eocd_start = total_size - eocd_window
-        eocd_blob = _get_range(f'bytes={eocd_start}-{total_size - 1}')
+def _find_zip_entry_central(cd_blob: bytes, wanted_name: bytes):
+    """Scans central directory blob, returns (local_header_offset_64bit,
+    compressed_size_64bit, compression_method). Handles ZIP64 extra fields."""
+    pos = 0
+    while pos + 46 <= len(cd_blob):
+        if cd_blob[pos:pos + 4] != CDFH_SIG:
+            break
+        comp_method    = struct.unpack('<H', cd_blob[pos + 10:pos + 12])[0]
+        comp_size      = struct.unpack('<I', cd_blob[pos + 20:pos + 24])[0]
+        name_len       = struct.unpack('<H', cd_blob[pos + 28:pos + 30])[0]
+        extra_len      = struct.unpack('<H', cd_blob[pos + 30:pos + 32])[0]
+        comment_len    = struct.unpack('<H', cd_blob[pos + 32:pos + 34])[0]
+        lho            = struct.unpack('<I', cd_blob[pos + 42:pos + 46])[0]
+        name           = cd_blob[pos + 46:pos + 46 + name_len]
 
-        eocd_pos = eocd_blob.rfind(EOCD_SIG)
-        if eocd_pos != -1:
-            cd_size   = struct.unpack('<I', eocd_blob[eocd_pos + 12:eocd_pos + 16])[0]
-            cd_offset = struct.unpack('<I', eocd_blob[eocd_pos + 16:eocd_pos + 20])[0]
+        # Parse ZIP64 extended information extra field (header id 0x0001)
+        extra = cd_blob[pos + 46 + name_len : pos + 46 + name_len + extra_len]
+        epos = 0
+        while epos + 4 <= len(extra):
+            hid = struct.unpack('<H', extra[epos:epos+2])[0]
+            hsz = struct.unpack('<H', extra[epos+2:epos+4])[0]
+            data = extra[epos+4 : epos+4+hsz]
+            if hid == 0x0001:
+                dpos = 0
+                if comp_size == 0xFFFFFFFF and dpos + 8 <= len(data):
+                    comp_size = struct.unpack('<Q', data[dpos:dpos+8])[0]; dpos += 8
+                if lho == 0xFFFFFFFF and dpos + 8 <= len(data):
+                    lho = struct.unpack('<Q', data[dpos:dpos+8])[0]; dpos += 8
+            epos += 4 + hsz
 
-            if cd_size > 0 and 0 <= cd_offset and cd_offset + cd_size <= total_size:
-                # Fetch only the central directory
-                cd_blob = _get_range(f'bytes={cd_offset}-{cd_offset + cd_size - 1}')
-
-                # Build a fake blob with synthetic EOCD so _find_zip_metadata_entry works
-                synthetic_eocd = (
-                    EOCD_SIG +
-                    b'\\x00\\x00\\x00\\x00' +
-                    b'\\x00\\x00\\x00\\x00' +
-                    struct.pack('<I', cd_size) +
-                    struct.pack('<I', 0) +
-                    b'\\x00\\x00'
-                )
-                fake_blob = cd_blob + synthetic_eocd
-                entry = _find_zip_metadata_entry(fake_blob, 0)
-
-                if entry:
-                    local_header_offset, compressed_size, compression_method, name = entry
-
-                    # Fetch local file header + data
-                    lh_blob = _get_range(f'bytes={local_header_offset}-{local_header_offset + 4096}')
-                    if lh_blob[0:4] == LFH_SIG:
-                        lh_name_len  = struct.unpack('<H', lh_blob[26:28])[0]
-                        lh_extra_len = struct.unpack('<H', lh_blob[28:30])[0]
-                        data_start   = 30 + lh_name_len + lh_extra_len
-
-                        if data_start + compressed_size <= len(lh_blob):
-                            entry_data = lh_blob[data_start:data_start + compressed_size]
-                        else:
-                            abs_start  = local_header_offset + data_start
-                            entry_data = _get_range(f'bytes={abs_start}-{abs_start + compressed_size - 1}')
-
-                        if compression_method == 0:
-                            plain = entry_data
-                        elif compression_method == 8:
-                            plain = zlib.decompress(entry_data, -15)
-                        else:
-                            plain = b''
-
-                        if plain:
-                            fields = _parse_all_metadata_lines(plain, PAYLOAD_METADATA_PREFIXES)
-                            if fields:
-                                out['found'] = True
-                                out['fields'] = fields
-                                return out
-    except Exception as e:
-        out['error'] = f"EOCD fast path failed: {e}"
-
-    # ── Fallback: 2 MB tail raw scan ──────────────────────────────────────
-    try:
-        chunk = 2 * 1024 * 1024
-        tail_offset = max(0, total_size - chunk)
-        tail_data = _get_range(f'bytes={tail_offset}-{total_size - 1}')
-
-        for prefix in PAYLOAD_METADATA_PREFIXES:
-            pos = tail_data.find(f'{prefix}='.encode('utf-8'))
-            if pos != -1:
-                block_end = tail_data.find(LFH_SIG, pos)
-                if block_end == -1:
-                    block_end = tail_data.find(CDFH_SIG, pos)
-                if block_end == -1:
-                    block_end = len(tail_data)
-                fields = _parse_all_metadata_lines(
-                    tail_data[max(0, pos - 4096):block_end], PAYLOAD_METADATA_PREFIXES)
-                if fields:
-                    out['found'] = True
-                    out['fields'] = fields
-                    return out
-
-        fields = _extract_metadata_kv(tail_data, PAYLOAD_METADATA_PREFIXES)
-        if fields:
-            out['found'] = True
-            out['fields'] = fields
-    except Exception as e:
-        if not out['error']:
-            out['error'] = f"Fallback tail scan failed: {e}"
-
-    return out
+        if name == wanted_name:
+            return lho, comp_size, comp_method
+        pos += 46 + name_len + extra_len + comment_len
+    return None
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Numbered file loader: 1.txt, 2.txt, 3.txt, ...
@@ -663,33 +589,56 @@ def get_post_build_fingerprints(url, reference_fingerprint, indent="  "):
     clean_fp  — the one matching reference_fingerprint's device (for display)
     clean_pre — matching pre-build entry (for display)
     """
+    # ── Fast path: EOCD / ZIP64 → central directory → metadata entry ─────
     try:
-        log(f"{indent}Fetching OTA metadata...")
-        meta = fetch_ota_metadata(url)
-        if not (meta['found'] and meta['fields']):
-            log(f"{indent}Metadata: not found{(' — ' + meta['error']) if meta.get('error') else ''}")
-            return [], None, None
+        window = min(total_size, 128 * 1024)
+        start = total_size - window
+        tail = _get_range(f'bytes={start}-{total_size - 1}')
 
-        fields = meta['fields']
-        all_fps   = []
-        clean_fp  = None
-        clean_pre = None
+        zip64 = _parse_zip64_eocd(tail)
+        if zip64:
+            _, cd_size, cd_offset = zip64
+        else:
+            eocd_pos = tail.rfind(EOCD_SIG)
+            if eocd_pos == -1:
+                raise ValueError("EOCD not found")
+            cd_size   = struct.unpack('<I', tail[eocd_pos + 12:eocd_pos + 16])[0]
+            cd_offset = struct.unpack('<I', tail[eocd_pos + 16:eocd_pos + 20])[0]
 
-        post_build_raw = fields.get('post-build', '')
-        if post_build_raw:
-            all_fps  = [fp.strip() for fp in post_build_raw.split('|') if fp.strip()]
-            clean_fp = pick_matching_fingerprint(all_fps, reference_fingerprint)
+        if cd_size <= 0 or cd_offset < 0 or cd_offset + cd_size > total_size:
+            raise ValueError(f"Bad central directory bounds: off={cd_offset} size={cd_size}")
 
-        pre_build = fields.get('pre-build', '')
-        if pre_build:
-            pre_fps   = [fp.strip() for fp in pre_build.split('|') if fp.strip()]
-            clean_pre = pick_matching_fingerprint(pre_fps, reference_fingerprint)
+        cd_blob = _get_range(f'bytes={cd_offset}-{cd_offset + cd_size - 1}')
+        entry = _find_zip_entry_central(cd_blob, b'META-INF/com/android/metadata')
 
-        return all_fps, clean_fp, clean_pre
+        if entry:
+            lh_off, comp_size, comp_method = entry
+            lh_blob = _get_range(f'bytes={lh_off}-{lh_off + 4096}')
+            if lh_blob[0:4] == LFH_SIG:
+                lh_name_len  = struct.unpack('<H', lh_blob[26:28])[0]
+                lh_extra_len = struct.unpack('<H', lh_blob[28:30])[0]
+                data_start   = 30 + lh_name_len + lh_extra_len
 
-    except Exception as me:
-        log(f"{indent}Metadata fetch error: {me}")
-        return [], None, None
+                if data_start + comp_size <= len(lh_blob):
+                    entry_data = lh_blob[data_start:data_start + comp_size]
+                else:
+                    abs_start = lh_off + data_start
+                    entry_data = _get_range(f'bytes={abs_start}-{abs_start + comp_size - 1}')
+
+                plain = b''
+                if comp_method == 0:
+                    plain = entry_data
+                elif comp_method == 8:
+                    plain = zlib.decompress(entry_data, -15)
+
+                if plain:
+                    fields = _parse_all_metadata_lines(plain, PAYLOAD_METADATA_PREFIXES)
+                    if fields:
+                        out['found'] = True
+                        out['fields'] = fields
+                        return out
+    except Exception as e:
+        out['error'] = f"EOCD fast path failed: {e}"
 
 
 def checkin_with_fingerprint_chain(serial, initial_fingerprint, archived_urls,
