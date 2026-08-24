@@ -497,8 +497,13 @@ def _find_zip_metadata_entry(tail_blob: bytes, tail_offset: int):
 
 def fetch_ota_metadata(url: str, timeout: int = 20) -> dict:
     """
-    Downloads only the tail of the OTA ZIP to extract META-INF/com/android/metadata
-    without fetching the whole file. Returns a dict with 'found' and 'fields'.
+    Fetches OTA metadata without downloading the whole file.
+
+    Strategy:
+    1. EOCD fast path: fetch only 66 KB tail to find EOCD, then fetch only the
+       central directory (usually a few KB), then fetch only the metadata entry.
+       Works for any file size including 6+ GB OTAs.
+    2. Fallback: 2 MB tail raw scan for known key prefixes.
     """
     out = {'found': False, 'fields': {}, 'error': None}
 
@@ -509,6 +514,7 @@ def fetch_ota_metadata(url: str, timeout: int = 20) -> dict:
         with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
             return resp.read()
 
+    # Get file size
     try:
         head_req = urllib.request.Request(url, method='HEAD',
                                           headers={'User-Agent': _METADATA_UA,
@@ -524,75 +530,96 @@ def fetch_ota_metadata(url: str, timeout: int = 20) -> dict:
         out['error'] = "Cannot determine file size"
         return out
 
-    chunk = 2 * 1024 * 1024
-    tail_offset = max(0, total_size - chunk)
+    # ── Fast path: EOCD → precise central directory → metadata entry ──────
     try:
-        tail_data = _get_range(f'bytes={tail_offset}-{total_size - 1}')
+        # 66 KB is enough to contain EOCD (22 bytes + up to 65535 bytes comment)
+        eocd_window = min(total_size, 66 * 1024)
+        eocd_start = total_size - eocd_window
+        eocd_blob = _get_range(f'bytes={eocd_start}-{total_size - 1}')
+
+        eocd_pos = eocd_blob.rfind(EOCD_SIG)
+        if eocd_pos != -1:
+            cd_size   = struct.unpack('<I', eocd_blob[eocd_pos + 12:eocd_pos + 16])[0]
+            cd_offset = struct.unpack('<I', eocd_blob[eocd_pos + 16:eocd_pos + 20])[0]
+
+            if cd_size > 0 and 0 <= cd_offset and cd_offset + cd_size <= total_size:
+                # Fetch only the central directory
+                cd_blob = _get_range(f'bytes={cd_offset}-{cd_offset + cd_size - 1}')
+
+                # Build a fake blob with synthetic EOCD so _find_zip_metadata_entry works
+                synthetic_eocd = (
+                    EOCD_SIG +
+                    b'\\x00\\x00\\x00\\x00' +
+                    b'\\x00\\x00\\x00\\x00' +
+                    struct.pack('<I', cd_size) +
+                    struct.pack('<I', 0) +
+                    b'\\x00\\x00'
+                )
+                fake_blob = cd_blob + synthetic_eocd
+                entry = _find_zip_metadata_entry(fake_blob, 0)
+
+                if entry:
+                    local_header_offset, compressed_size, compression_method, name = entry
+
+                    # Fetch local file header + data
+                    lh_blob = _get_range(f'bytes={local_header_offset}-{local_header_offset + 4096}')
+                    if lh_blob[0:4] == LFH_SIG:
+                        lh_name_len  = struct.unpack('<H', lh_blob[26:28])[0]
+                        lh_extra_len = struct.unpack('<H', lh_blob[28:30])[0]
+                        data_start   = 30 + lh_name_len + lh_extra_len
+
+                        if data_start + compressed_size <= len(lh_blob):
+                            entry_data = lh_blob[data_start:data_start + compressed_size]
+                        else:
+                            abs_start  = local_header_offset + data_start
+                            entry_data = _get_range(f'bytes={abs_start}-{abs_start + compressed_size - 1}')
+
+                        if compression_method == 0:
+                            plain = entry_data
+                        elif compression_method == 8:
+                            plain = zlib.decompress(entry_data, -15)
+                        else:
+                            plain = b''
+
+                        if plain:
+                            fields = _parse_all_metadata_lines(plain, PAYLOAD_METADATA_PREFIXES)
+                            if fields:
+                                out['found'] = True
+                                out['fields'] = fields
+                                return out
     except Exception as e:
-        out['error'] = f"Tail fetch failed: {e}"
-        return out
+        out['error'] = f"EOCD fast path failed: {e}"
 
-    entry = _find_zip_metadata_entry(tail_data, tail_offset)
-    if entry:
-        local_header_offset, compressed_size, compression_method, _ = entry
-        lh_start = local_header_offset - tail_offset
-        try:
-            if 0 <= lh_start and lh_start + 30 <= len(tail_data):
-                lh_blob = tail_data
-                lh_pos  = lh_start
-            else:
-                lh_blob = _get_range(f'bytes={local_header_offset}-{local_header_offset + 4096}')
-                lh_pos  = 0
+    # ── Fallback: 2 MB tail raw scan ──────────────────────────────────────
+    try:
+        chunk = 2 * 1024 * 1024
+        tail_offset = max(0, total_size - chunk)
+        tail_data = _get_range(f'bytes={tail_offset}-{total_size - 1}')
 
-            if lh_blob[lh_pos:lh_pos + 4] == LFH_SIG:
-                name_len  = struct.unpack('<H', lh_blob[lh_pos + 26:lh_pos + 28])[0]
-                extra_len = struct.unpack('<H', lh_blob[lh_pos + 28:lh_pos + 30])[0]
-                data_start = lh_pos + 30 + name_len + extra_len
+        for prefix in PAYLOAD_METADATA_PREFIXES:
+            pos = tail_data.find(f'{prefix}='.encode('utf-8'))
+            if pos != -1:
+                block_end = tail_data.find(LFH_SIG, pos)
+                if block_end == -1:
+                    block_end = tail_data.find(CDFH_SIG, pos)
+                if block_end == -1:
+                    block_end = len(tail_data)
+                fields = _parse_all_metadata_lines(
+                    tail_data[max(0, pos - 4096):block_end], PAYLOAD_METADATA_PREFIXES)
+                if fields:
+                    out['found'] = True
+                    out['fields'] = fields
+                    return out
 
-                if data_start + compressed_size <= len(lh_blob):
-                    entry_data = lh_blob[data_start:data_start + compressed_size]
-                else:
-                    abs_start  = local_header_offset + 30 + name_len + extra_len
-                    entry_data = _get_range(f'bytes={abs_start}-{abs_start + compressed_size - 1}')
-
-                if compression_method == 0:
-                    plain = entry_data
-                elif compression_method == 8:
-                    plain = zlib.decompress(entry_data, -15)
-                else:
-                    plain = b''
-
-                if plain:
-                    fields = _parse_all_metadata_lines(plain, PAYLOAD_METADATA_PREFIXES)
-                    if fields:
-                        out['found'] = True
-                        out['fields'] = fields
-                        return out
-        except Exception as e:
-            out['error'] = f"Entry extraction failed: {e}"
-
-    for prefix in PAYLOAD_METADATA_PREFIXES:
-        pos = tail_data.find(f'{prefix}='.encode('utf-8'))
-        if pos != -1:
-            block_end = tail_data.find(LFH_SIG, pos)
-            if block_end == -1:
-                block_end = tail_data.find(CDFH_SIG, pos)
-            if block_end == -1:
-                block_end = len(tail_data)
-            fields = _parse_all_metadata_lines(tail_data[max(0, pos - 4096):block_end],
-                                               PAYLOAD_METADATA_PREFIXES)
-            if fields:
-                out['found'] = True
-                out['fields'] = fields
-                return out
-
-    fields = _extract_metadata_kv(tail_data, PAYLOAD_METADATA_PREFIXES)
-    if fields:
-        out['found'] = True
-        out['fields'] = fields
+        fields = _extract_metadata_kv(tail_data, PAYLOAD_METADATA_PREFIXES)
+        if fields:
+            out['found'] = True
+            out['fields'] = fields
+    except Exception as e:
+        if not out['error']:
+            out['error'] = f"Fallback tail scan failed: {e}"
 
     return out
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Numbered file loader: 1.txt, 2.txt, 3.txt, ...
@@ -673,9 +700,6 @@ def checkin_with_fingerprint_chain(serial, initial_fingerprint, archived_urls,
     Each unique fingerprint is checked with checkin only once per run.
     Each unique URL is expanded (metadata fetched) only once per run.
     """
-    if initial_fingerprint in visited_fingerprints:
-        return
-
     queue = [initial_fingerprint]
 
     while queue:
@@ -753,8 +777,9 @@ def run_xr():
     log(f"Loaded {len(archived_urls)} archived URL(s) from {ARCHIVED_FILE}.")
 
     new_findings      = []
-    expanded_urls     = set()   # URLs whose post-build fingerprints have been fetched — shared globally
-    visited_fps       = set()   # fingerprints already checked with checkin — shared globally
+    expanded_urls     = set()   # URLs already expanded (metadata fetched) — shared globally across all serials
+    # NOTE: visited_fps is NOT shared across serials — different serials can return different URLs
+    # for the same fingerprint. Only post-build fingerprints within a chain are deduplicated.
 
     for fingerprint, serials, filename in file_groups:
         log(f"\n--- Processing {filename} | Fingerprint: {fingerprint} ---")
@@ -762,6 +787,7 @@ def run_xr():
 
         for idx, serial in enumerate(serials, 1):
             log(f"[{idx}/{total}] Checking serial: {serial}")
+            visited_fps = set()  # fresh per serial — each serial can find different URLs
             checkin_with_fingerprint_chain(
                 serial, fingerprint, archived_urls, new_findings,
                 expanded_urls, visited_fps
