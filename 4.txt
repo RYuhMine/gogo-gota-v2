@@ -1,0 +1,2 @@
+google/jinju/jinju:9/1/1:userdebug/test-keys,dev-keys,release-keys
+R4AL4006FTZ
