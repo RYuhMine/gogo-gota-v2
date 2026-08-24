@@ -666,19 +666,17 @@ def get_post_build_fingerprints(url, reference_fingerprint, indent="  "):
 
 
 def checkin_with_fingerprint_chain(serial, initial_fingerprint, archived_urls,
-                                   new_findings, indent="  "):
+                                   new_findings, expanded_urls, visited_fingerprints,
+                                   indent="  "):
     """
-    Logic per serial+fingerprint:
-      1. Checkin → get URL
-      2. If URL is NEW → log, save to archived, send to Discord, fetch post-build → chain those fingerprints
-      3. If URL already EXISTS → silently fetch post-build → chain those fingerprints (no report)
-      4. Each chained fingerprint is tried once; if it returns the same URL that was already
-         processed in this chain — skip (don't fetch metadata again for it).
+    expanded_urls and visited_fingerprints are shared across ALL serials and files.
+    Each unique fingerprint is checked with checkin only once per run.
+    Each unique URL is expanded (metadata fetched) only once per run.
     """
+    if initial_fingerprint in visited_fingerprints:
+        return
+
     queue = [initial_fingerprint]
-    visited_fingerprints = set()
-    # URLs whose post-build fingerprints have already been queued this chain
-    expanded_urls = set()
 
     while queue:
         fingerprint = queue.pop(0)
@@ -723,19 +721,13 @@ def checkin_with_fingerprint_chain(serial, initial_fingerprint, archived_urls,
                     archived_urls.add(url)
                     save_archived_url(url)
                 else:
-                    log(f"{indent}URL already archived — checking post-build fingerprints.")
+                    log(f"{indent}URL already archived — queuing post-build fingerprints.")
 
-                # Either way, chain the post-build fingerprints
                 for fp in all_fps:
                     if fp not in visited_fingerprints:
                         queue.append(fp)
             else:
-                # URL already expanded this run — just skip
-                if is_new:
-                    # Shouldn't normally happen, but handle it
-                    log(f"{indent}*** NEW URL FOUND (already expanded) ***")
-                else:
-                    log(f"{indent}URL already archived and expanded, skipping.")
+                log(f"{indent}URL already expanded this run, skipping.")
 
         except Exception as e:
             log(f"{indent}[ERROR] {e}")
@@ -760,7 +752,9 @@ def run_xr():
     archived_urls = load_archived_urls()
     log(f"Loaded {len(archived_urls)} archived URL(s) from {ARCHIVED_FILE}.")
 
-    new_findings = []
+    new_findings      = []
+    expanded_urls     = set()   # URLs whose post-build fingerprints have been fetched — shared globally
+    visited_fps       = set()   # fingerprints already checked with checkin — shared globally
 
     for fingerprint, serials, filename in file_groups:
         log(f"\n--- Processing {filename} | Fingerprint: {fingerprint} ---")
@@ -769,7 +763,8 @@ def run_xr():
         for idx, serial in enumerate(serials, 1):
             log(f"[{idx}/{total}] Checking serial: {serial}")
             checkin_with_fingerprint_chain(
-                serial, fingerprint, archived_urls, new_findings
+                serial, fingerprint, archived_urls, new_findings,
+                expanded_urls, visited_fps
             )
 
     log(f"\nRun complete. {len(new_findings)} new finding(s) this run.")
