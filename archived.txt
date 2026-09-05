@@ -9,3 +9,4 @@ https://android.googleapis.com/packages/ota-api/package/31db23c86a328ce9e5b93045
 https://android.googleapis.com/packages/ota-api/package/05adf502f58fffc344029bb26da9ec25ba8d35ef.zip
 https://android.googleapis.com/packages/ota-api/package/7e8c995fa0be8d3a5da56b4d4472e848f8ad25e8.zip
 https://android.googleapis.com/packages/ota-api/package/0b3cdfcfa50234e6b10cab67537607483d023139.zip
+https://android.googleapis.com/packages/ota-api/package/f527d0ca311a3d5a2ebb53adaf4294fb664f0681.zip
